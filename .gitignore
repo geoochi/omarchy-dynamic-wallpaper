@@ -1,0 +1,4 @@
+# The render itself: the Blender project, the source passes, and the 1440-frame
+# sequence the wallpaper reads at runtime. Large binaries, and not part of the
+# scheme -- the wallpaper only needs the frames to exist on disk.
+indoor/

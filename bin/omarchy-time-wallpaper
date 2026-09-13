@@ -1,0 +1,108 @@
+#!/bin/bash
+# Show the timelapse frame matching the current local time of day.
+# Run every minute by omarchy-time-wallpaper.timer and once by the post-boot hook.
+#
+# The frame sequence is one frame per minute of a 24h day (1440 frames), named
+# as zero-padded 4-digit indices: <dir>/NNNN.webp.
+#
+# It only owns the background when it was asked to: selecting the "time-lapse"
+# entry in the background picker (a copy of one frame, dropped into the theme's
+# background folder) or already showing one of the frames. Any other background
+# -- a static wallpaper, a video wallpaper, a theme default -- means someone else
+# owns it, and this script leaves it alone. That also makes it yield to Omarchy's
+# own video wallpaper: choose a video and this stops on the next tick.
+set -uo pipefail
+
+FRAMES_DIR=${OMARCHY_TIME_WALLPAPER_DIR:-"$HOME/Work/omarchy-dynamic-wallpaper/indoor/out"}
+BACKGROUNDS_DIR="$HOME/.config/omarchy/backgrounds"
+SENTINEL_NAME="time-lapse.webp"
+CURRENT_LINK="$HOME/.local/state/omarchy/current/background"
+
+dry_run=0
+case ${1:-} in
+--dry-run) dry_run=1 ;;
+-h | --help)
+  cat <<EOF
+Usage: omarchy-time-wallpaper [--dry-run]
+
+Sets the background to the frame whose index equals the current minute of the
+day (hour * 60 + minute), so a 1440-frame daily timelapse tracks wall-clock time.
+
+It acts only while it owns the background: while the current background is one of
+the frames, or is the picker entry below. Choose any other wallpaper to hand the
+background back.
+
+Frame directory: $FRAMES_DIR
+Picker entry:    $BACKGROUNDS_DIR/<theme>/$SENTINEL_NAME
+Override the frame directory with OMARCHY_TIME_WALLPAPER_DIR.
+
+While the render is still in progress, missing frames fall back to the highest
+rendered index at or below the current minute, so the background always shows
+the latest scene already available.
+EOF
+  exit 0
+  ;;
+"") ;;
+*)
+  echo "Unknown argument: $1" >&2
+  exit 2
+  ;;
+esac
+
+current=$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)
+
+# Do we own the background? Either it is already one of our frames, or it is the
+# picker entry that turns the timelapse on.
+active=0
+if [[ -n $current && $current == "$FRAMES_DIR/"* ]]; then
+  active=1
+else
+  for sentinel in "$BACKGROUNDS_DIR"/*/"$SENTINEL_NAME"; do
+    [[ -e $sentinel ]] || continue
+    if [[ $current == "$(readlink -f "$sentinel")" ]]; then
+      active=1
+      break
+    fi
+  done
+fi
+
+if [[ ! -d $FRAMES_DIR ]]; then
+  ((dry_run)) && echo "frame directory not found: $FRAMES_DIR"
+  exit 0
+fi
+
+# %H and %M are always two digits; 10# forces base-10 so 08/09 are not octal.
+target=$((10#$(date +%H) * 60 + 10#$(date +%M)))
+
+# Sorted lexicographically == numerically, because indices are zero-padded.
+mapfile -t frames < <(
+  find "$FRAMES_DIR" -maxdepth 1 -type f -regextype posix-extended \
+    -regex '.*/[0-9]{4}\.(webp|png|jpe?g)' -printf '%f\n' 2>/dev/null | sort
+)
+if ((${#frames[@]} == 0)); then
+  ((dry_run)) && echo "no frames rendered yet in $FRAMES_DIR"
+  exit 0
+fi
+
+# Highest rendered frame at or below the target minute; otherwise the earliest.
+chosen=${frames[0]}
+for name in "${frames[@]}"; do
+  ((10#${name:0:4} <= target)) || break
+  chosen=$name
+done
+frame="$FRAMES_DIR/$chosen"
+
+if ((dry_run)); then
+  echo "active=$active minute=$target -> $frame (current: ${current:-none})"
+  exit 0
+fi
+
+# Someone else owns the background; stay out of the way.
+((active)) || exit 0
+
+# Nothing to do when this minute's frame is already showing: avoids a symlink
+# write and a background transition every minute while the render is catching up.
+[[ $current == "$(readlink -f "$frame")" ]] && exit 0
+
+echo "Time wallpaper: minute $target -> $chosen"
+omarchy theme bg set "$frame"

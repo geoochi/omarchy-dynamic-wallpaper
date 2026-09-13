@@ -1,0 +1,39 @@
+#!/bin/bash
+# Install the picker entry that turns the time-lapse wallpaper on.
+#
+# tenzin's background picker lists whatever image files sit in the theme's
+# background folders, so the timelapse needs a file there to be selectable at
+# all. That file is only a handle: selecting it makes the background pointer
+# land on it, which is what omarchy-time-wallpaper watches for. Its thumbnail is
+# the only thing identifying it in the picker (the picker renders no labels), so
+# the frame it copies should read well as a still.
+#
+# Frame 0420 (07:00) is the default: bright, and early enough to look like a
+# morning scene. Re-run after adding a theme, or to change the cover.
+set -euo pipefail
+
+FRAMES_DIR=${OMARCHY_TIME_WALLPAPER_DIR:-"$HOME/Work/omarchy-dynamic-wallpaper/indoor/out"}
+BACKGROUNDS_DIR="$HOME/.config/omarchy/backgrounds"
+SENTINEL_NAME="time-lapse.webp"
+FRAME_INDEX=${1:-0420}
+
+frame="$FRAMES_DIR/$FRAME_INDEX.webp"
+[[ -f $frame ]] || {
+  echo "frame not found: $frame" >&2
+  exit 1
+}
+
+installed=0
+for dir in "$BACKGROUNDS_DIR"/*/; do
+  [[ -d $dir ]] || continue
+  # Not a theme: tenzin keeps loose videos here.
+  [[ $(basename "$dir") == "videos" ]] && continue
+  cp -f "$frame" "$dir$SENTINEL_NAME"
+  echo "installed $dir$SENTINEL_NAME"
+  installed=$((installed + 1))
+done
+
+(( installed )) || {
+  echo "no theme background folders under $BACKGROUNDS_DIR" >&2
+  exit 1
+}

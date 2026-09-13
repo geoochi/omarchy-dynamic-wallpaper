@@ -1,0 +1,11 @@
+[Unit]
+Description=Set the background to the current minute's timelapse frame
+# No compositor means no shell to retint: skip instead of writing a background
+# into a session that is not there.
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=oneshot
+# The frame render is CPU/GPU heavy; never compete with it.
+Nice=10
+ExecStart=%h/.local/bin/omarchy-time-wallpaper

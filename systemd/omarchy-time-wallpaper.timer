@@ -1,0 +1,11 @@
+[Unit]
+Description=Advance the timelapse background once per minute
+
+[Timer]
+OnCalendar=*:*:00
+# The default 1min accuracy would let systemd coalesce runs across minute
+# boundaries and skip frames; keep it tight for a 1-minute period.
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
