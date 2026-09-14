@@ -15,9 +15,8 @@ set -euo pipefail
 
 VIDEO=${OMARCHY_TIME_WALLPAPER_VIDEO:-"$HOME/Work/omarchy-dynamic-wallpaper/indoor/t_g1440_qp0.mkv"}
 BACKGROUNDS_DIR="$HOME/.config/omarchy/backgrounds"
-SENTINEL_NAME="time-lapse.webp"
+SENTINEL_NAME="time-lapse.png"
 FRAME_INDEX=${1:-420}
-QUALITY=90
 HWACCEL=${OMARCHY_TIME_WALLPAPER_HWACCEL:-auto}
 
 if [[ ! -f $VIDEO ]]; then
@@ -40,10 +39,10 @@ decode_cover() {
   fi
   ffmpeg -nostdin -loglevel error "${acceleration[@]}" \
     -i "$VIDEO" -vf "select=gte(n\\,$FRAME_INDEX)" -frames:v 1 \
-    -c:v libwebp -quality "$QUALITY" -y "$out"
+    -c:v png -pix_fmt rgb24 -compression_level 3 -pred none -y "$out"
 }
 
-scratch=$(mktemp --suffix=.webp)
+scratch=$(mktemp --suffix=.png)
 trap 'rm -f "$scratch"' EXIT
 
 decoded=0

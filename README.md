@@ -28,7 +28,7 @@ open and reads exactly one frame per minute from it:
 ```
 ffmpeg -hwaccel cuda -i <video> \
   -vf "select=gte(n\,TARGET)" -fps_mode passthrough \
-  -c:v libwebp -quality 90 -f image2pipe -
+  -c:v png -pix_fmt rgb24 -compression_level 3 -pred none -f image2pipe -
 ```
 
 `select` makes ffmpeg decode frames `0..TARGET` internally (unavoidable) but
@@ -36,9 +36,16 @@ push only `TARGET` onward, so catch-up costs decoding and nothing else. Once the
 live stream is at the current minute, ffmpeg blocks on the pipe between reads —
 that back-pressure *is* the pacing, and steady-state cost is ~0.3 s per minute.
 
-Each frame is written as a WebP file and handed to Omarchy with
+Each frame is written as a PNG file and handed to Omarchy with
 `omarchy theme bg set`, the same path the built-in background picker uses, so
 transitions, the lock screen and theme retinting all behave normally.
+
+PNG rather than WebP: the source is yuv444p, and libwebp's lossy mode would
+subsample that to 4:2:0 and add a second generation of loss on top of the
+video's own. `-pred none` with `-compression_level 3` measured both faster and
+smaller than the encoder defaults on sampled frames, and encoding is cheap
+enough (tens of milliseconds) that the per-minute cost is still dominated by
+reading the frame, not by the encoder.
 
 Three details make it robust:
 
@@ -72,7 +79,8 @@ not exit on a bad tick. `ConditionEnvironment=WAYLAND_DISPLAY` skips sessions
 with no compositor, where there is nothing to hand a background to.
 
 Decoded frames are written to `~/.local/state/omarchy/time-wallpaper/frames/`,
-three at a time. They live under `state` rather than `cache` because the
+three at a time (a few MiB each, so about a dozen MiB in total). They live under
+`state` rather than `cache` because the
 background symlink must still resolve after a reboot, and must not be deleted by
 a cache cleaner while it is being displayed. Inside the theme background folders
 they would instead grow the picker's thumbnail cache without bound.
@@ -104,7 +112,7 @@ Uninstall:
 systemctl --user disable --now omarchy-time-wallpaper.service
 rm -f ~/.local/bin/omarchy-time-wallpaper ~/.local/bin/omarchy-time-wallpaper-cover \
       ~/.config/systemd/user/omarchy-time-wallpaper.service
-rm -f ~/.config/omarchy/backgrounds/*/time-lapse.webp
+rm -f ~/.config/omarchy/backgrounds/*/time-lapse.png
 rm -rf ~/.local/state/omarchy/time-wallpaper
 ```
 
@@ -117,10 +125,10 @@ back.
 The picker renders no labels — entries are identified by thumbnail alone — so
 the scheme needs a file inside the theme's background folder to be selectable at
 all. `omarchy-time-wallpaper-cover` decodes one frame from the video and installs
-it there as `time-lapse.webp`:
+it there as `time-lapse.png`:
 
 ```
-~/.config/omarchy/backgrounds/<theme>/time-lapse.webp
+~/.config/omarchy/backgrounds/<theme>/time-lapse.png
 ```
 
 That file is only a handle: selecting it makes the background pointer land on

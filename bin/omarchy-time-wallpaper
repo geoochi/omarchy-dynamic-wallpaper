@@ -27,7 +27,7 @@ VIDEO = os.environ.get("OMARCHY_TIME_WALLPAPER_VIDEO") or os.path.join(
 FRAME_DIR = os.environ.get("OMARCHY_TIME_WALLPAPER_DIR") or os.path.join(
     HOME, ".local", "state", "omarchy", "time-wallpaper", "frames")
 BACKGROUNDS_DIR = os.path.join(HOME, ".config", "omarchy", "backgrounds")
-SENTINEL_NAME = "time-lapse.webp"
+SENTINEL_NAME = "time-lapse.png"
 BACKGROUND_LINK = os.path.join(
     HOME, ".local", "state", "omarchy", "current", "background")
 
@@ -35,7 +35,6 @@ HWACCEL = os.environ.get("OMARCHY_TIME_WALLPAPER_HWACCEL", "auto").strip().lower
 if HWACCEL not in ("auto", "cuda", "none"):
     HWACCEL = "auto"
 
-QUALITY = 90          # libwebp quality: ~80 KB for a 4K frame
 KEEP_FRAMES = 3       # decoded frames kept on disk, including the displayed one
 SKIP_MAX = 5          # frames to read and discard before preferring a restart
 POLL_SECONDS = 5      # how often ownership is re-checked
@@ -78,18 +77,33 @@ def _read_exact(stream, size):
     return bytes(buffer)
 
 
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
 def _read_frame(stream):
-    """Read one standalone WebP file off ffmpeg's image2pipe output."""
-    header = _read_exact(stream, 8)
-    if header is None or header[:4] != b"RIFF":
+    """Read one standalone PNG off ffmpeg's image2pipe output.
+
+    Unlike RIFF, a PNG carries no outer length, so walk the chunk headers until
+    the IEND chunk and keep everything up to and including it.
+    """
+    signature = _read_exact(stream, len(PNG_SIGNATURE))
+    if signature != PNG_SIGNATURE:
         return None
-    size = int.from_bytes(header[4:8], "little")
-    if size <= 0 or size > 64 * 1024 * 1024:
-        return None
-    payload = _read_exact(stream, size)
-    if payload is None:
-        return None
-    return header + payload
+    parts = [signature]
+    while True:
+        header = _read_exact(stream, 8)          # chunk length + chunk type
+        if header is None:
+            return None
+        length = int.from_bytes(header[:4], "big")
+        if length > 64 * 1024 * 1024:
+            return None
+        body = _read_exact(stream, length + 4)   # chunk data + CRC
+        if body is None:
+            return None
+        parts.append(header)
+        parts.append(body)
+        if header[4:8] == b"IEND":
+            return b"".join(parts)
 
 
 class Decoder:
@@ -139,7 +153,12 @@ class Decoder:
             # through the pipe, which is what makes catch-up cheap.
             "-vf", "select=gte(n\\,%d)" % index,
             "-fps_mode", "passthrough",
-            "-c:v", "libwebp", "-quality", str(QUALITY),
+            # PNG rather than WebP: the source is yuv444p, and libwebp's lossy
+            # mode would subsample it to 4:2:0 and add a second generation of
+            # loss on top. These settings measured both faster and smaller than
+            # the encoder defaults across sampled frames.
+            "-c:v", "png", "-pix_fmt", "rgb24",
+            "-compression_level", "3", "-pred", "none",
             "-f", "image2pipe", "-",
         ]
         log("decode start at frame %d (hw=%s)"
@@ -167,7 +186,7 @@ def write_frame(data, index):
     """Write atomically so the background is never pointed at a partial file."""
     os.makedirs(FRAME_DIR, mode=0o700, exist_ok=True)
     final = os.path.join(
-        FRAME_DIR, "frame-%04d-%013d.webp" % (index, int(time.time() * 1000)))
+        FRAME_DIR, "frame-%04d-%013d.png" % (index, int(time.time() * 1000)))
     partial = final + ".part"
     with open(partial, "wb") as handle:
         handle.write(data)
@@ -181,7 +200,7 @@ def prune_frames(protect):
     """Keep the newest frames, never the one currently displayed."""
     protected = os.path.realpath(protect)
     others = []
-    for path in glob.glob(os.path.join(FRAME_DIR, "frame-*.webp")):
+    for path in glob.glob(os.path.join(FRAME_DIR, "frame-*.png")):
         if os.path.realpath(path) == protected:
             continue
         try:
@@ -230,8 +249,8 @@ def run():
 
     decoder = Decoder()
     current = None
-    log("video=%s frame_dir=%s hwaccel=%s quality=%d"
-        % (VIDEO, FRAME_DIR, HWACCEL, QUALITY))
+    log("video=%s frame_dir=%s hwaccel=%s format=png"
+        % (VIDEO, FRAME_DIR, HWACCEL))
 
     try:
         while True:
@@ -297,12 +316,11 @@ def run():
 
 def dry_run():
     current = os.path.realpath(BACKGROUND_LINK)
-    kept = sorted(glob.glob(os.path.join(FRAME_DIR, "frame-*.webp")))
+    kept = sorted(glob.glob(os.path.join(FRAME_DIR, "frame-*.png")))
     print("video:       %s (%s)"
           % (VIDEO, "present" if os.path.isfile(VIDEO) else "MISSING"))
     print("frame dir:   %s" % FRAME_DIR)
     print("hwaccel:     %s" % HWACCEL)
-    print("quality:     %d" % QUALITY)
     print("minute:      %d" % minute_index())
     print("background:  %s" % current)
     print("owned:       %s" % ("yes" if owns_background() else "no"))
