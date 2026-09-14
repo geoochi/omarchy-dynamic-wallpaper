@@ -3,9 +3,15 @@
 
 The source is one video whose only keyframe is its first frame, so there is no
 random access -- reaching minute N means decoding frames 0..N. Decoding from
-scratch every minute would cost 8-18 s of CPU each time, so this runs as a
-long-lived service instead: one ffmpeg stays open, exactly one frame is read
-from it per minute, and ffmpeg blocks on the pipe the rest of the time.
+scratch every minute would cost seconds each time, so this runs as a long-lived
+service instead: one ffmpeg stays open, exactly one frame is read from it per
+minute, and ffmpeg blocks on the pipe the rest of the time.
+
+Decoding is software. The stream is HEVC Rext coded in gbrp (planar RGB) to keep
+the render's colour exact, and NVDEC cannot decode it: `-hwaccel cuda` silently
+falls back to software while still honouring the narrowed thread count, and
+forcing `hevc_cuvid` decodes the RGB bitstream as if it were YUV and returns
+green garbage. So there is no hardware path to choose between.
 
 Ownership is read from the background pointer, never from a state file. It acts
 only while the current background is one of its own frames or the picker entry,
@@ -23,7 +29,7 @@ from datetime import datetime
 HOME = os.path.expanduser("~")
 
 VIDEO = os.environ.get("OMARCHY_TIME_WALLPAPER_VIDEO") or os.path.join(
-    HOME, "Work", "omarchy-dynamic-wallpaper", "indoor", "t_g1440_qp0.mkv")
+    HOME, "Work", "omarchy-dynamic-wallpaper", "indoor", "t_g1440_qp6_gbrp.mkv")
 FRAME_DIR = os.environ.get("OMARCHY_TIME_WALLPAPER_DIR") or os.path.join(
     HOME, ".local", "state", "omarchy", "time-wallpaper", "frames")
 BACKGROUNDS_DIR = os.path.join(HOME, ".config", "omarchy", "backgrounds")
@@ -31,16 +37,11 @@ SENTINEL_NAME = "time-lapse.png"
 BACKGROUND_LINK = os.path.join(
     HOME, ".local", "state", "omarchy", "current", "background")
 
-HWACCEL = os.environ.get("OMARCHY_TIME_WALLPAPER_HWACCEL", "auto").strip().lower()
-if HWACCEL not in ("auto", "cuda", "none"):
-    HWACCEL = "auto"
-
+DECODE_THREADS = "6"  # measured: 1280 MB / 19 s catch-up, against 1901 MB at the
+                      # default pool and 1108 MB at four threads for 34 s
 KEEP_FRAMES = 3       # decoded frames kept on disk, including the displayed one
-SKIP_MAX = 5          # frames to read and discard before preferring a restart
+SKIP_FRAMES = 5       # frames to read and discard before preferring a restart
 POLL_SECONDS = 5      # how often ownership is re-checked
-
-# None = hardware not tried yet, True = use it, False = software only.
-_hw_usable = None if HWACCEL == "auto" else (HWACCEL == "cuda")
 
 
 class _Stop(Exception):
@@ -141,23 +142,9 @@ class Decoder:
                 pass
 
     def start(self, index):
-        hardware = _hw_usable is not False
         self.stop()
-        if hardware:
-            # NVDEC does the work on the GPU, so the default decode thread pool
-            # buys little here: it keeps ~350 MB of 4K frames alive for a
-            # decoder that serves one frame a minute. Measured 1797 MB -> 1446 MB
-            # resident and 880 -> 544 MiB of VRAM, for about a second more
-            # catch-up (7.2 s -> 8.1 s off a warm page cache).
-            decode_options = ["-hwaccel", "cuda", "-threads", "1"]
-        else:
-            # Software decode is CPU-bound, and catching up is a rare, one-off
-            # cost, so trade threads for memory: four measured as the balance
-            # (~1900 MB at the default pool against ~1170 MB here).
-            decode_options = ["-threads", "4"]
-        self.stop()
-        command = ["ffmpeg", "-nostdin", "-loglevel", "error", *decode_options,
-                   "-filter_threads", "1",
+        command = ["ffmpeg", "-nostdin", "-loglevel", "error",
+                   "-threads", DECODE_THREADS, "-filter_threads", "1",
                    "-i", VIDEO,
                    # The only keyframe is frame 0, so decoding 0..index is
                    # unavoidable. `select` drops those frames inside ffmpeg
@@ -165,16 +152,14 @@ class Decoder:
                    # makes catch-up cheap.
                    "-vf", "select=gte(n\\,%d)" % index,
                    "-fps_mode", "passthrough",
-                   # PNG rather than WebP: the source is yuv444p, and libwebp's
-                   # lossy mode would subsample it to 4:2:0 and add a second
-                   # generation of loss on top. These settings measured both
-                   # faster and smaller than the encoder defaults on sampled
-                   # frames.
+                   # PNG rather than WebP: the source is gbrp (planar RGB), and
+                   # libwebp's lossy mode would subsample it to 4:2:0 and add a
+                   # second generation of loss on top. These settings measured
+                   # both faster and smaller than the encoder defaults.
                    "-c:v", "png", "-pix_fmt", "rgb24",
                    "-compression_level", "3", "-pred", "none",
                    "-f", "image2pipe", "-"]
-        log("decode start at frame %d (hw=%s)"
-            % (index, "cuda" if hardware else "software"))
+        log("decode start at frame %d" % index)
         self.proc = subprocess.Popen(
             command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
         self.next_index = index
@@ -257,12 +242,10 @@ def sleep_until_next_tick():
 
 
 def run():
-    global _hw_usable
-
     decoder = Decoder()
     current = None
-    log("video=%s frame_dir=%s hwaccel=%s format=png"
-        % (VIDEO, FRAME_DIR, HWACCEL))
+    log("video=%s frame_dir=%s threads=%s format=png"
+        % (VIDEO, FRAME_DIR, DECODE_THREADS))
 
     try:
         while True:
@@ -287,9 +270,15 @@ def run():
                 sleep_until_next_tick()
                 continue
 
-            # A live stream can only serve `target` if it is that close to `current`.
+            # A live stream can only serve `target` if it is that close to
+            # `current`. Skipping frames costs ffmpeg a decode *and* a re-encode
+            # each (~184 ms measured, mostly the 3.5 MB PNG), where restarting
+            # decodes without encoding (~12 ms a frame). So a restart wins as
+            # soon as the gap is any real fraction of the way to `target`;
+            # below that, and for a wake from a short sleep, skipping is far
+            # cheaper than re-decoding the whole day up to now.
             gap = target - current if (decoder.alive() and current is not None) else None
-            if gap is None or gap <= 0 or gap > SKIP_MAX:
+            if gap is None or gap <= 0 or gap > max(SKIP_FRAMES, target // 15):
                 decoder.start(target)
             else:
                 for _ in range(gap - 1):
@@ -299,15 +288,10 @@ def run():
 
             got = decoder.next_frame()
             if got is None and decoder.read_count == 0 and not decoder.killed_by_us:
-                # Nothing came out of this stream. A non-zero exit before the
-                # first frame means the hardware decoder cannot handle this
-                # machine or file (ffmpeg does not fall back on its own).
-                code = decoder.exit_code()
-                if _hw_usable is None and code not in (None, 0):
-                    log("hardware decode failed (ffmpeg exit %s); using software" % code)
-                    _hw_usable = False
-                else:
-                    log("no frame from the decoder (ffmpeg exit %s); retrying" % code)
+                # Nothing came out of a stream that died on its own. One retry,
+                # then leave it for the next minute rather than spinning.
+                log("no frame from the decoder (ffmpeg exit %s); retrying"
+                    % decoder.exit_code())
                 decoder.start(target)
                 got = decoder.next_frame()
 
@@ -332,7 +316,7 @@ def dry_run():
     print("video:       %s (%s)"
           % (VIDEO, "present" if os.path.isfile(VIDEO) else "MISSING"))
     print("frame dir:   %s" % FRAME_DIR)
-    print("hwaccel:     %s" % HWACCEL)
+    print("threads:     %s" % DECODE_THREADS)
     print("minute:      %d" % minute_index())
     print("background:  %s" % current)
     print("owned:       %s" % ("yes" if owns_background() else "no"))

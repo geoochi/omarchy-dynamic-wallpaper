@@ -26,7 +26,7 @@ burn 8–18 s of CPU each time, which is why this is **not** a timer.
 open and reads exactly one frame per minute from it:
 
 ```
-ffmpeg -hwaccel cuda -i <video> \
+ffmpeg -threads 6 -filter_threads 1 -i <video> \
   -vf "select=gte(n\,TARGET)" -fps_mode passthrough \
   -c:v png -pix_fmt rgb24 -compression_level 3 -pred none -f image2pipe -
 ```
@@ -40,8 +40,8 @@ Each frame is written as a PNG file and handed to Omarchy with
 `omarchy theme bg set`, the same path the built-in background picker uses, so
 transitions, the lock screen and theme retinting all behave normally.
 
-PNG rather than WebP: the source is yuv444p, and libwebp's lossy mode would
-subsample that to 4:2:0 and add a second generation of loss on top of the
+PNG rather than WebP: the source is gbrp, planar RGB, and libwebp's lossy mode
+would subsample that to 4:2:0 and add a second generation of loss on top of the
 video's own. `-pred none` with `-compression_level 3` measured both faster and
 smaller than the encoder defaults on sampled frames, and encoding is cheap
 enough (tens of milliseconds) that the per-minute cost is still dominated by
@@ -59,10 +59,13 @@ Three details make it robust:
   back within seconds. There is no state file: the background pointer *is* the
   state, so restarting the shell, switching themes or crashing cannot leave it
   stuck claiming a wallpaper it no longer shows.
-- **Hardware decode is optional.** It tries `-hwaccel cuda` first and falls back
-  to software for the rest of the process lifetime if ffmpeg dies before the
-  first frame. This system lives on a portable drive and moves between machines,
-  so the software path has to work on its own.
+- **Decoding is software, and that is not a fallback.** The stream is HEVC Rext
+  coded in gbrp to keep the render's colour exact, and NVDEC cannot decode it.
+  `-hwaccel cuda` does not fail — it silently drops to the software decoder
+  while still honouring the narrowed thread count, which is the slowest possible
+  combination — and forcing `hevc_cuvid` decodes the RGB bitstream as if it were
+  YUV, returning green frames. So there is no hardware path to choose between,
+  and the thread count is the only dial: see the caveats.
 
 ## Layout
 
@@ -97,14 +100,13 @@ systemctl --user daemon-reload
 systemctl --user enable --now omarchy-time-wallpaper.service
 ```
 
-The scheme reads `~/Work/omarchy-dynamic-wallpaper/indoor/t_g1440_qp0.mkv` and
-writes to `~/.local/state/omarchy/time-wallpaper/frames/`. Override with:
+The scheme reads `~/Work/omarchy-dynamic-wallpaper/indoor/t_g1440_qp6_gbrp.mkv`
+and writes to `~/.local/state/omarchy/time-wallpaper/frames/`. Override with:
 
 | Variable | Default |
 | --- | --- |
-| `OMARCHY_TIME_WALLPAPER_VIDEO` | `~/Work/omarchy-dynamic-wallpaper/indoor/t_g1440_qp0.mkv` |
+| `OMARCHY_TIME_WALLPAPER_VIDEO` | `~/Work/omarchy-dynamic-wallpaper/indoor/t_g1440_qp6_gbrp.mkv` |
 | `OMARCHY_TIME_WALLPAPER_DIR` | `~/.local/state/omarchy/time-wallpaper/frames` |
-| `OMARCHY_TIME_WALLPAPER_HWACCEL` | `auto` (`auto` \| `cuda` \| `none`) |
 
 Uninstall:
 
@@ -162,19 +164,26 @@ plugin's own switches honour `keepBackground`.
 
 ## Caveats
 
-- **Booting late in the day costs a catch-up.** Starting at minute 1300 means
-  decoding 1300 frames before the first frame is shown. Measured on the reference
-  machine at frame 983: **5.9 s with CUDA, 13.8 s in software**, so a boot near
-  midnight is roughly 9 s / 20 s. Until then the desktop keeps showing the
-  previous frame — the background symlink survives a reboot — so there is no
-  black flash, but the frame is briefly stale.
-- **A decoder stays resident.** That is the price of serving one frame a minute
-  cheaply, and it is why the decode options are narrowed rather than left at the
-  defaults: measured ~1.4 GB of RAM and ~540 MiB of VRAM with NVDEC and
-  `-threads 1 -filter_threads 1`, against ~1.8 GB and ~880 MiB at the defaults
-  (for about a second more catch-up). The software fallback uses four threads
-  instead, trading a slower catch-up for ~700 MB. Freeing all of it would mean
-  decoding on demand, which costs 7–9 s every minute rather than once.
+- **Booting late in the day costs a catch-up.** Starting at minute 1069 means
+  decoding 1069 frames before the first frame is shown — measured at **14 s**,
+  and roughly 19 s for a minute near midnight. Until then the desktop keeps
+  showing the previous frame — the background symlink survives a reboot — so
+  there is no black flash, but the frame is briefly stale.
+- **A decoder stays resident, and software decoding makes it the only real
+  dial.** One frame a minute is nearly free, but the process holds its decode
+  buffers all day, so the thread count is chosen rather than left at the default
+  pool. Measured, on the 4K gbrp source: **1265 MB at six threads (14 s
+  catch-up)**, 1108 MB at four (34 s), 1387 MB at eight (18 s) and 1901 MB at
+  the default pool (12 s). Six threads is the balance. It also uses **no VRAM at
+  all**, which matters more here than the memory: the GPU stays free for renders.
+  Freeing the RAM entirely would mean decoding on demand instead of staying
+  resident, which costs 12–34 s up to several times a day rather than once.
+- **Skipping ahead is cheap; re-decoding is not.** After a sleep, the frame
+  index is recomputed and the gap is usually skipped by reading frames off the
+  live stream. That costs ffmpeg a decode *and* a re-encode per frame worth
+  skipped (~184 ms, mostly the 3.5 MB PNG), while restarting the stream decodes
+  without encoding (~12 ms a frame) — so the daemon restarts once the gap passes
+  about a fifteenth of the way to the current minute, and skips below that.
 - Activating takes up to ~5 s: ownership is polled, not watched.
 - Every change plays Omarchy's ~420 ms background reveal. That is the background
   plugin's own behaviour, not something this scheme controls.

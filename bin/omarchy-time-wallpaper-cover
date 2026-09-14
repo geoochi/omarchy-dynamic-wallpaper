@@ -13,11 +13,11 @@
 # the .mkv. Re-run after adding a theme, or to change the cover.
 set -euo pipefail
 
-VIDEO=${OMARCHY_TIME_WALLPAPER_VIDEO:-"$HOME/Work/omarchy-dynamic-wallpaper/indoor/t_g1440_qp0.mkv"}
+VIDEO=${OMARCHY_TIME_WALLPAPER_VIDEO:-"$HOME/Work/omarchy-dynamic-wallpaper/indoor/t_g1440_qp6_gbrp.mkv"}
 BACKGROUNDS_DIR="$HOME/.config/omarchy/backgrounds"
 SENTINEL_NAME="time-lapse.png"
 FRAME_INDEX=${1:-420}
-HWACCEL=${OMARCHY_TIME_WALLPAPER_HWACCEL:-auto}
+DECODE_THREADS=6
 
 if [[ ! -f $VIDEO ]]; then
   echo "video not found: $VIDEO" >&2
@@ -28,16 +28,12 @@ if [[ ! $FRAME_INDEX =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
-# The only keyframe is frame 0, so this decodes 0..FRAME_INDEX and keeps the
-# last one. Decoding index 420 costs a couple of seconds.
+# The only keyframe is frame 0, so this decodes 0..FRAME_INDEX and keeps the last
+# one: about five seconds of software decode for the default index. Decoding is
+# software because the stream is RGB and NVDEC cannot read it (see the daemon).
 decode_cover() {
   local out="$1"
-  local hardware="$2"
-  local acceleration=()
-  if [[ $hardware == cuda ]]; then
-    acceleration=(-hwaccel cuda)
-  fi
-  ffmpeg -nostdin -loglevel error "${acceleration[@]}" \
+  ffmpeg -nostdin -loglevel error -threads "$DECODE_THREADS" -filter_threads 1 \
     -i "$VIDEO" -vf "select=gte(n\\,$FRAME_INDEX)" -frames:v 1 \
     -c:v png -pix_fmt rgb24 -compression_level 3 -pred none -y "$out"
 }
@@ -45,25 +41,7 @@ decode_cover() {
 scratch=$(mktemp --suffix=.png)
 trap 'rm -f "$scratch"' EXIT
 
-decoded=0
-case $HWACCEL in
-cuda)
-  decode_cover "$scratch" cuda && decoded=1
-  ;;
-none)
-  decode_cover "$scratch" software && decoded=1
-  ;;
-*)
-  if decode_cover "$scratch" cuda; then
-    decoded=1
-  else
-    echo "hardware decode unavailable; using software" >&2
-    decode_cover "$scratch" software && decoded=1
-  fi
-  ;;
-esac
-
-if ((!decoded)) || [[ ! -s $scratch ]]; then
+if ! decode_cover "$scratch" || [[ ! -s $scratch ]]; then
   echo "could not decode frame $FRAME_INDEX from $VIDEO" >&2
   exit 1
 fi
