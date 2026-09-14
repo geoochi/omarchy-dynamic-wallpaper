@@ -71,19 +71,12 @@ Three details make it robust:
 | `bin/omarchy-time-wallpaper` | `~/.local/bin/omarchy-time-wallpaper` |
 | `bin/omarchy-time-wallpaper-cover` | `~/.local/bin/omarchy-time-wallpaper-cover` |
 | `systemd/omarchy-time-wallpaper.service` | `~/.config/systemd/user/omarchy-time-wallpaper.service` |
-| `systemd/omarchy-time-wallpaper-cover.service` | `~/.config/systemd/user/omarchy-time-wallpaper-cover.service` |
-| `systemd/omarchy-time-wallpaper-cover.timer` | `~/.config/systemd/user/omarchy-time-wallpaper-cover.timer` |
 
 The service is `Type=simple` because it is long-lived, `After=`/`PartOf=`
 `graphical-session.target` so it starts and stops with the session, and
 `Restart=always` as a backstop only — the daemon handles its own errors and does
 not exit on a bad tick. `ConditionEnvironment=WAYLAND_DISPLAY` skips sessions
 with no compositor, where there is nothing to hand a background to.
-
-The `-cover` pair is separate and much cheaper: a oneshot that copies the newest
-decoded frame over the picker handle, on an hourly timer. It never decodes —
-reaching the current minute would cost seconds — so it is only a file copy. See
-"Choosing it" for why the handle is refreshed at all.
 
 Decoded frames are written to `~/.local/state/omarchy/time-wallpaper/frames/`,
 three at a time (a few MiB each, so about a dozen MiB in total). They live under
@@ -97,14 +90,11 @@ they would instead grow the picker's thumbnail cache without bound.
 ```sh
 install -Dm755 bin/omarchy-time-wallpaper       ~/.local/bin/omarchy-time-wallpaper
 install -Dm755 bin/omarchy-time-wallpaper-cover ~/.local/bin/omarchy-time-wallpaper-cover
-install -Dm644 systemd/omarchy-time-wallpaper.service       ~/.config/systemd/user/omarchy-time-wallpaper.service
-install -Dm644 systemd/omarchy-time-wallpaper-cover.service ~/.config/systemd/user/omarchy-time-wallpaper-cover.service
-install -Dm644 systemd/omarchy-time-wallpaper-cover.timer   ~/.config/systemd/user/omarchy-time-wallpaper-cover.timer
+install -Dm644 systemd/omarchy-time-wallpaper.service ~/.config/systemd/user/omarchy-time-wallpaper.service
 
 bin/omarchy-time-wallpaper-cover          # the picker entry, see below
 systemctl --user daemon-reload
 systemctl --user enable --now omarchy-time-wallpaper.service
-systemctl --user enable --now omarchy-time-wallpaper-cover.timer
 ```
 
 The scheme reads `~/Work/omarchy-dynamic-wallpaper/indoor/t_g1440_qp0.mkv` and
@@ -119,11 +109,9 @@ writes to `~/.local/state/omarchy/time-wallpaper/frames/`. Override with:
 Uninstall:
 
 ```sh
-systemctl --user disable --now omarchy-time-wallpaper.service omarchy-time-wallpaper-cover.timer
+systemctl --user disable --now omarchy-time-wallpaper.service
 rm -f ~/.local/bin/omarchy-time-wallpaper ~/.local/bin/omarchy-time-wallpaper-cover \
-      ~/.config/systemd/user/omarchy-time-wallpaper.service \
-      ~/.config/systemd/user/omarchy-time-wallpaper-cover.service \
-      ~/.config/systemd/user/omarchy-time-wallpaper-cover.timer
+      ~/.config/systemd/user/omarchy-time-wallpaper.service
 rm -f ~/.config/omarchy/backgrounds/*/time-lapse.png
 rm -rf ~/.local/state/omarchy/time-wallpaper
 ```
@@ -144,36 +132,9 @@ it there as `time-lapse.png`:
 ```
 
 That file is only a handle: selecting it makes the background pointer land on
-it, which is what the daemon watches for. Its content is the thumbnail. Frame
-`420` (07:00) is the default; pass another index to change it, and re-run the
-helper after adding a theme.
-
-### Keeping the handle near the current time
-
-A handle frozen at 07:00 reads as an ordinary morning photo, so an hourly timer
-refreshes it from the newest frame the daemon has already decoded:
-
-```sh
-omarchy-time-wallpaper-cover --latest
-```
-
-It copies rather than decodes, because a decode would have to walk the video
-from frame 0 and cost seconds — long enough to make opening the picker feel
-slow. So the entry in **Style → Background** shows roughly the current time of
-day: morning, afternoon, evening.
-
-The cost is that every refresh gives the handle a new mtime, and Omarchy's picker
-keys thumbnails on `path:size:mtime` **without eviction**, so each refresh adds
-a thumbnail to `~/.cache/omarchy/live-wallpaper/`. That is why the interval is an
-hour rather than a minute; widen it in
-`systemd/omarchy-time-wallpaper-cover.timer` if the cache matters more than a
-slightly stale handle.
-
-A genuinely *animated* entry is not possible without patching: the picker draws
-each entry with a plain `QtQuick.Image` (`ImagePicker.qml`), which renders only
-the first frame of an animated file, and it displays a generated still thumbnail
-rather than the file itself. Animating it would mean changing both Omarchy's
-picker and tenzin's thumbnail generation, and re-applying both after updates.
+it, which is what the daemon watches for. Its content is the thumbnail, so the
+frame chosen should read well as a still. Frame `420` (07:00) is the default;
+pass another index to change it, and re-run the helper after adding a theme.
 
 The handle is **not** committed to this repository. Publishing one frame of the
 artwork is a different decision from publishing the scheme.
@@ -223,9 +184,7 @@ plugin's own switches honour `keepBackground`.
 python3 -m py_compile bin/omarchy-time-wallpaper
 bin/omarchy-time-wallpaper --dry-run    # video, frame dir, ownership, minute
 bash -n bin/omarchy-time-wallpaper-cover
-bin/omarchy-time-wallpaper-cover --latest   # refresh the handle by hand
 journalctl --user -u omarchy-time-wallpaper.service -f
-journalctl --user -u omarchy-time-wallpaper-cover.service
 ```
 
 `--dry-run` reports `owned: no` whenever something other than this scheme owns
