@@ -143,24 +143,36 @@ class Decoder:
     def start(self, index):
         hardware = _hw_usable is not False
         self.stop()
-        command = ["ffmpeg", "-nostdin", "-loglevel", "error"]
         if hardware:
-            command += ["-hwaccel", "cuda"]
-        command += [
-            "-i", VIDEO,
-            # The only keyframe is frame 0, so decoding 0..index is unavoidable.
-            # `select` drops those frames inside ffmpeg instead of pushing them
-            # through the pipe, which is what makes catch-up cheap.
-            "-vf", "select=gte(n\\,%d)" % index,
-            "-fps_mode", "passthrough",
-            # PNG rather than WebP: the source is yuv444p, and libwebp's lossy
-            # mode would subsample it to 4:2:0 and add a second generation of
-            # loss on top. These settings measured both faster and smaller than
-            # the encoder defaults across sampled frames.
-            "-c:v", "png", "-pix_fmt", "rgb24",
-            "-compression_level", "3", "-pred", "none",
-            "-f", "image2pipe", "-",
-        ]
+            # NVDEC does the work on the GPU, so the default decode thread pool
+            # buys little here: it keeps ~350 MB of 4K frames alive for a
+            # decoder that serves one frame a minute. Measured 1797 MB -> 1446 MB
+            # resident and 880 -> 544 MiB of VRAM, for about a second more
+            # catch-up (7.2 s -> 8.1 s off a warm page cache).
+            decode_options = ["-hwaccel", "cuda", "-threads", "1"]
+        else:
+            # Software decode is CPU-bound, and catching up is a rare, one-off
+            # cost, so trade threads for memory: four measured as the balance
+            # (~1900 MB at the default pool against ~1170 MB here).
+            decode_options = ["-threads", "4"]
+        self.stop()
+        command = ["ffmpeg", "-nostdin", "-loglevel", "error", *decode_options,
+                   "-filter_threads", "1",
+                   "-i", VIDEO,
+                   # The only keyframe is frame 0, so decoding 0..index is
+                   # unavoidable. `select` drops those frames inside ffmpeg
+                   # instead of pushing them through the pipe, which is what
+                   # makes catch-up cheap.
+                   "-vf", "select=gte(n\\,%d)" % index,
+                   "-fps_mode", "passthrough",
+                   # PNG rather than WebP: the source is yuv444p, and libwebp's
+                   # lossy mode would subsample it to 4:2:0 and add a second
+                   # generation of loss on top. These settings measured both
+                   # faster and smaller than the encoder defaults on sampled
+                   # frames.
+                   "-c:v", "png", "-pix_fmt", "rgb24",
+                   "-compression_level", "3", "-pred", "none",
+                   "-f", "image2pipe", "-"]
         log("decode start at frame %d (hw=%s)"
             % (index, "cuda" if hardware else "software"))
         self.proc = subprocess.Popen(

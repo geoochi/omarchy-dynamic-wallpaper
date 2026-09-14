@@ -168,6 +168,13 @@ plugin's own switches honour `keepBackground`.
   midnight is roughly 9 s / 20 s. Until then the desktop keeps showing the
   previous frame — the background symlink survives a reboot — so there is no
   black flash, but the frame is briefly stale.
+- **A decoder stays resident.** That is the price of serving one frame a minute
+  cheaply, and it is why the decode options are narrowed rather than left at the
+  defaults: measured ~1.4 GB of RAM and ~540 MiB of VRAM with NVDEC and
+  `-threads 1 -filter_threads 1`, against ~1.8 GB and ~880 MiB at the defaults
+  (for about a second more catch-up). The software fallback uses four threads
+  instead, trading a slower catch-up for ~700 MB. Freeing all of it would mean
+  decoding on demand, which costs 7–9 s every minute rather than once.
 - Activating takes up to ~5 s: ownership is polled, not watched.
 - Every change plays Omarchy's ~420 ms background reveal. That is the background
   plugin's own behaviour, not something this scheme controls.
