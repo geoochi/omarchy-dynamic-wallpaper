@@ -5,31 +5,70 @@
 # background folders, so the timelapse needs a file there to be selectable at
 # all. That file is only a handle: selecting it makes the background pointer
 # land on it, which is what omarchy-time-wallpaper watches for. Its thumbnail is
-# the only thing identifying it in the picker (the picker renders no labels), so
-# the frame it shows should read well as a still.
+# the only thing identifying it in the picker (the picker renders no labels).
 #
-# Frame 420 (07:00) is the default: bright, and early enough to look like a
-# morning scene. It is decoded from the video, so the scheme needs nothing but
-# the .mkv. Re-run after adding a theme, or to change the cover.
+# Two ways to produce it:
+#
+#   (no argument)   decode frame 420 (07:00) from the video -- the static cover
+#   <frame-index>   decode that frame instead
+#   --latest        copy the newest frame omarchy-time-wallpaper already decoded
+#
+# --latest is what the hourly timer runs: it keeps the handle near the current
+# time of day at the cost of a file copy. Decoding the current minute instead
+# would take seconds (the video has a single keyframe, so reaching minute N
+# means decoding 0..N), which is why the timer copies rather than decodes.
 set -euo pipefail
 
 VIDEO=${OMARCHY_TIME_WALLPAPER_VIDEO:-"$HOME/Work/omarchy-dynamic-wallpaper/indoor/t_g1440_qp0.mkv"}
+FRAME_DIR=${OMARCHY_TIME_WALLPAPER_DIR:-"$HOME/.local/state/omarchy/time-wallpaper/frames"}
 BACKGROUNDS_DIR="$HOME/.config/omarchy/backgrounds"
 SENTINEL_NAME="time-lapse.png"
-FRAME_INDEX=${1:-420}
+DEFAULT_INDEX=420
 HWACCEL=${OMARCHY_TIME_WALLPAPER_HWACCEL:-auto}
 
-if [[ ! -f $VIDEO ]]; then
-  echo "video not found: $VIDEO" >&2
-  exit 1
-fi
-if [[ ! $FRAME_INDEX =~ ^[0-9]+$ ]]; then
-  echo "frame index must be a number: $FRAME_INDEX" >&2
-  exit 1
+mode=decode
+frame_index=$DEFAULT_INDEX
+
+case ${1:-} in
+"") ;;
+--latest)
+  mode=latest
+  ;;
+-h | --help)
+  cat <<EOF
+Usage: omarchy-time-wallpaper-cover [--latest | <frame-index>]
+
+Installs the time-lapse picker handle ($SENTINEL_NAME) into every theme's
+background folder. The picker shows no labels, so that file is the only thing
+identifying the entry, and it is also where the background pointer lands when
+the entry is selected.
+
+  (no argument)   decode frame $DEFAULT_INDEX (07:00) from the video
+  <frame-index>   decode that frame instead
+  --latest        copy the newest frame omarchy-time-wallpaper already decoded
+
+--latest is what the hourly timer runs, to keep the handle near the current
+time of day. Re-run without arguments after adding a theme.
+EOF
+  exit 0
+  ;;
+*)
+  if [[ $1 =~ ^[0-9]+$ ]]; then
+    frame_index=$1
+  else
+    echo "unknown argument: $1" >&2
+    exit 2
+  fi
+  ;;
+esac
+
+if (($# > 1)); then
+  echo "too many arguments: $*" >&2
+  exit 2
 fi
 
-# The only keyframe is frame 0, so this decodes 0..FRAME_INDEX and keeps the
-# last one. Decoding index 420 costs a couple of seconds.
+# The only keyframe is frame 0, so this decodes 0..frame_index and keeps the
+# last one.
 decode_cover() {
   local out="$1"
   local hardware="$2"
@@ -38,33 +77,54 @@ decode_cover() {
     acceleration=(-hwaccel cuda)
   fi
   ffmpeg -nostdin -loglevel error "${acceleration[@]}" \
-    -i "$VIDEO" -vf "select=gte(n\\,$FRAME_INDEX)" -frames:v 1 \
+    -i "$VIDEO" -vf "select=gte(n\\,$frame_index)" -frames:v 1 \
     -c:v png -pix_fmt rgb24 -compression_level 3 -pred none -y "$out"
 }
 
 scratch=$(mktemp --suffix=.png)
 trap 'rm -f "$scratch"' EXIT
 
-decoded=0
-case $HWACCEL in
-cuda)
-  decode_cover "$scratch" cuda && decoded=1
-  ;;
-none)
-  decode_cover "$scratch" software && decoded=1
-  ;;
-*)
-  if decode_cover "$scratch" cuda; then
-    decoded=1
-  else
-    echo "hardware decode unavailable; using software" >&2
-    decode_cover "$scratch" software && decoded=1
+if [[ $mode == latest ]]; then
+  newest=$(find "$FRAME_DIR" -maxdepth 1 -type f -name 'frame-*.png' \
+    -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2- || true)
+  if [[ -z $newest ]]; then
+    echo "no decoded frames in $FRAME_DIR yet; leaving the handle alone" >&2
+    exit 0
   fi
-  ;;
-esac
+  cp -f "$newest" "$scratch"
+  echo "handle from $(basename "$newest")"
+else
+  if [[ ! -f $VIDEO ]]; then
+    echo "video not found: $VIDEO" >&2
+    exit 1
+  fi
 
-if ((!decoded)) || [[ ! -s $scratch ]]; then
-  echo "could not decode frame $FRAME_INDEX from $VIDEO" >&2
+  decoded=0
+  case $HWACCEL in
+  cuda)
+    decode_cover "$scratch" cuda && decoded=1
+    ;;
+  none)
+    decode_cover "$scratch" software && decoded=1
+    ;;
+  *)
+    if decode_cover "$scratch" cuda; then
+      decoded=1
+    else
+      echo "hardware decode unavailable; using software" >&2
+      decode_cover "$scratch" software && decoded=1
+    fi
+    ;;
+  esac
+
+  if ((!decoded)); then
+    echo "could not decode frame $frame_index from $VIDEO" >&2
+    exit 1
+  fi
+fi
+
+if [[ ! -s $scratch ]]; then
+  echo "produced an empty handle" >&2
   exit 1
 fi
 

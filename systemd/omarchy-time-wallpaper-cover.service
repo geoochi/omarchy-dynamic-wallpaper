@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh the time-lapse picker handle
+# No compositor means no picker to show a handle in.
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=oneshot
+# A file copy, but never compete with the decoder or an interactive session.
+Nice=15
+ExecStart=%h/.local/bin/omarchy-time-wallpaper-cover --latest
