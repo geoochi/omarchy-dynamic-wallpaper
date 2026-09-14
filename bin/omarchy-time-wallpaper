@@ -1,108 +1,342 @@
-#!/bin/bash
-# Show the timelapse frame matching the current local time of day.
-# Run every minute by omarchy-time-wallpaper.timer and once by the post-boot hook.
-#
-# The frame sequence is one frame per minute of a 24h day (1440 frames), named
-# as zero-padded 4-digit indices: <dir>/NNNN.webp.
-#
-# It only owns the background when it was asked to: selecting the "time-lapse"
-# entry in the background picker (a copy of one frame, dropped into the theme's
-# background folder) or already showing one of the frames. Any other background
-# -- a static wallpaper, a video wallpaper, a theme default -- means someone else
-# owns it, and this script leaves it alone. That also makes it yield to Omarchy's
-# own video wallpaper: choose a video and this stops on the next tick.
-set -uo pipefail
+#!/usr/bin/env python3
+"""Time-of-day wallpaper: show the timelapse frame for the current minute.
 
-FRAMES_DIR=${OMARCHY_TIME_WALLPAPER_DIR:-"$HOME/Work/omarchy-dynamic-wallpaper/indoor/out"}
-BACKGROUNDS_DIR="$HOME/.config/omarchy/backgrounds"
-SENTINEL_NAME="time-lapse.webp"
-CURRENT_LINK="$HOME/.local/state/omarchy/current/background"
+The source is one video whose only keyframe is its first frame, so there is no
+random access -- reaching minute N means decoding frames 0..N. Decoding from
+scratch every minute would cost 8-18 s of CPU each time, so this runs as a
+long-lived service instead: one ffmpeg stays open, exactly one frame is read
+from it per minute, and ffmpeg blocks on the pipe the rest of the time.
 
-dry_run=0
-case ${1:-} in
---dry-run) dry_run=1 ;;
--h | --help)
-  cat <<EOF
-Usage: omarchy-time-wallpaper [--dry-run]
+Ownership is read from the background pointer, never from a state file. It acts
+only while the current background is one of its own frames or the picker entry,
+and stands down otherwise -- which is how it yields to any other wallpaper.
+"""
 
-Sets the background to the frame whose index equals the current minute of the
-day (hour * 60 + minute), so a 1440-frame daily timelapse tracks wall-clock time.
+import glob
+import os
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime
 
-It acts only while it owns the background: while the current background is one of
-the frames, or is the picker entry below. Choose any other wallpaper to hand the
-background back.
+HOME = os.path.expanduser("~")
 
-Frame directory: $FRAMES_DIR
-Picker entry:    $BACKGROUNDS_DIR/<theme>/$SENTINEL_NAME
-Override the frame directory with OMARCHY_TIME_WALLPAPER_DIR.
+VIDEO = os.environ.get("OMARCHY_TIME_WALLPAPER_VIDEO") or os.path.join(
+    HOME, "Work", "omarchy-dynamic-wallpaper", "indoor", "t_g1440_qp0.mkv")
+FRAME_DIR = os.environ.get("OMARCHY_TIME_WALLPAPER_DIR") or os.path.join(
+    HOME, ".local", "state", "omarchy", "time-wallpaper", "frames")
+BACKGROUNDS_DIR = os.path.join(HOME, ".config", "omarchy", "backgrounds")
+SENTINEL_NAME = "time-lapse.webp"
+BACKGROUND_LINK = os.path.join(
+    HOME, ".local", "state", "omarchy", "current", "background")
 
-While the render is still in progress, missing frames fall back to the highest
-rendered index at or below the current minute, so the background always shows
-the latest scene already available.
-EOF
-  exit 0
-  ;;
-"") ;;
-*)
-  echo "Unknown argument: $1" >&2
-  exit 2
-  ;;
-esac
+HWACCEL = os.environ.get("OMARCHY_TIME_WALLPAPER_HWACCEL", "auto").strip().lower()
+if HWACCEL not in ("auto", "cuda", "none"):
+    HWACCEL = "auto"
 
-current=$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)
+QUALITY = 90          # libwebp quality: ~80 KB for a 4K frame
+KEEP_FRAMES = 3       # decoded frames kept on disk, including the displayed one
+SKIP_MAX = 5          # frames to read and discard before preferring a restart
+POLL_SECONDS = 5      # how often ownership is re-checked
 
-# Do we own the background? Either it is already one of our frames, or it is the
-# picker entry that turns the timelapse on.
-active=0
-if [[ -n $current && $current == "$FRAMES_DIR/"* ]]; then
-  active=1
-else
-  for sentinel in "$BACKGROUNDS_DIR"/*/"$SENTINEL_NAME"; do
-    [[ -e $sentinel ]] || continue
-    if [[ $current == "$(readlink -f "$sentinel")" ]]; then
-      active=1
-      break
-    fi
-  done
-fi
+# None = hardware not tried yet, True = use it, False = software only.
+_hw_usable = None if HWACCEL == "auto" else (HWACCEL == "cuda")
 
-if [[ ! -d $FRAMES_DIR ]]; then
-  ((dry_run)) && echo "frame directory not found: $FRAMES_DIR"
-  exit 0
-fi
 
-# %H and %M are always two digits; 10# forces base-10 so 08/09 are not octal.
-target=$((10#$(date +%H) * 60 + 10#$(date +%M)))
+class _Stop(Exception):
+    """Raised by the signal handlers so the decoder is torn down promptly."""
 
-# Sorted lexicographically == numerically, because indices are zero-padded.
-mapfile -t frames < <(
-  find "$FRAMES_DIR" -maxdepth 1 -type f -regextype posix-extended \
-    -regex '.*/[0-9]{4}\.(webp|png|jpe?g)' -printf '%f\n' 2>/dev/null | sort
-)
-if ((${#frames[@]} == 0)); then
-  ((dry_run)) && echo "no frames rendered yet in $FRAMES_DIR"
-  exit 0
-fi
 
-# Highest rendered frame at or below the target minute; otherwise the earliest.
-chosen=${frames[0]}
-for name in "${frames[@]}"; do
-  ((10#${name:0:4} <= target)) || break
-  chosen=$name
-done
-frame="$FRAMES_DIR/$chosen"
+def log(message):
+    print(time.strftime("[%H:%M:%S] ") + message, flush=True)
 
-if ((dry_run)); then
-  echo "active=$active minute=$target -> $frame (current: ${current:-none})"
-  exit 0
-fi
 
-# Someone else owns the background; stay out of the way.
-((active)) || exit 0
+def minute_index():
+    now = datetime.now()
+    return now.hour * 60 + now.minute
 
-# Nothing to do when this minute's frame is already showing: avoids a symlink
-# write and a background transition every minute while the render is catching up.
-[[ $current == "$(readlink -f "$frame")" ]] && exit 0
 
-echo "Time wallpaper: minute $target -> $chosen"
-omarchy theme bg set "$frame"
+def owns_background():
+    """True while the background pointer names one of our frames or the picker entry."""
+    current = os.path.realpath(BACKGROUND_LINK)
+    if current.startswith(FRAME_DIR.rstrip("/") + os.sep):
+        return True
+    for sentinel in glob.glob(os.path.join(BACKGROUNDS_DIR, "*", SENTINEL_NAME)):
+        if os.path.realpath(sentinel) == current:
+            return True
+    return False
+
+
+def _read_exact(stream, size):
+    buffer = bytearray()
+    while len(buffer) < size:
+        chunk = stream.read(size - len(buffer))
+        if not chunk:
+            return None
+        buffer.extend(chunk)
+    return bytes(buffer)
+
+
+def _read_frame(stream):
+    """Read one standalone WebP file off ffmpeg's image2pipe output."""
+    header = _read_exact(stream, 8)
+    if header is None or header[:4] != b"RIFF":
+        return None
+    size = int.from_bytes(header[4:8], "little")
+    if size <= 0 or size > 64 * 1024 * 1024:
+        return None
+    payload = _read_exact(stream, size)
+    if payload is None:
+        return None
+    return header + payload
+
+
+class Decoder:
+    """A live ffmpeg whose next frame is `next_index`."""
+
+    def __init__(self):
+        self.proc = None
+        self.next_index = None
+        self.read_count = 0
+        self.killed_by_us = False
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def exit_code(self):
+        return None if self.proc is None else self.proc.returncode
+
+    def stop(self):
+        proc = self.proc
+        self.proc = None
+        self.next_index = None
+        self.read_count = 0
+        if proc is None:
+            return
+        self.killed_by_us = True
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        if proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+
+    def start(self, index):
+        hardware = _hw_usable is not False
+        self.stop()
+        command = ["ffmpeg", "-nostdin", "-loglevel", "error"]
+        if hardware:
+            command += ["-hwaccel", "cuda"]
+        command += [
+            "-i", VIDEO,
+            # The only keyframe is frame 0, so decoding 0..index is unavoidable.
+            # `select` drops those frames inside ffmpeg instead of pushing them
+            # through the pipe, which is what makes catch-up cheap.
+            "-vf", "select=gte(n\\,%d)" % index,
+            "-fps_mode", "passthrough",
+            "-c:v", "libwebp", "-quality", str(QUALITY),
+            "-f", "image2pipe", "-",
+        ]
+        log("decode start at frame %d (hw=%s)"
+            % (index, "cuda" if hardware else "software"))
+        self.proc = subprocess.Popen(
+            command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+        self.next_index = index
+        self.read_count = 0
+        self.killed_by_us = False
+
+    def next_frame(self):
+        """Return (index, webp_bytes), or None when the stream ended or died."""
+        if self.proc is None:
+            return None
+        data = _read_frame(self.proc.stdout)
+        if data is None:
+            return None
+        index = self.next_index
+        self.next_index += 1
+        self.read_count += 1
+        return index, data
+
+
+def write_frame(data, index):
+    """Write atomically so the background is never pointed at a partial file."""
+    os.makedirs(FRAME_DIR, mode=0o700, exist_ok=True)
+    final = os.path.join(
+        FRAME_DIR, "frame-%04d-%013d.webp" % (index, int(time.time() * 1000)))
+    partial = final + ".part"
+    with open(partial, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(partial, final)
+    return final
+
+
+def prune_frames(protect):
+    """Keep the newest frames, never the one currently displayed."""
+    protected = os.path.realpath(protect)
+    others = []
+    for path in glob.glob(os.path.join(FRAME_DIR, "frame-*.webp")):
+        if os.path.realpath(path) == protected:
+            continue
+        try:
+            others.append((os.path.getmtime(path), path))
+        except OSError:
+            pass
+    others.sort()
+    while len(others) > KEEP_FRAMES - 1:
+        _, path = others.pop(0)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    cutoff = time.time() - 60
+    for path in glob.glob(os.path.join(FRAME_DIR, "*.part")):
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.unlink(path)
+        except OSError:
+            pass
+
+
+def set_background(path):
+    try:
+        result = subprocess.run(
+            ["omarchy", "theme", "bg", "set", path],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        log("could not set the background: %s" % error)
+        return False
+    if result.returncode != 0:
+        log("omarchy theme bg set exited %d" % result.returncode)
+        return False
+    return True
+
+
+def sleep_until_next_tick():
+    """Sleep to the next minute boundary, waking early to re-check ownership."""
+    remaining = 60.0 - (time.time() % 60.0)
+    time.sleep(max(0.2, min(remaining, POLL_SECONDS)))
+
+
+def run():
+    global _hw_usable
+
+    decoder = Decoder()
+    current = None
+    log("video=%s frame_dir=%s hwaccel=%s quality=%d"
+        % (VIDEO, FRAME_DIR, HWACCEL, QUALITY))
+
+    try:
+        while True:
+            target = minute_index()
+
+            if not owns_background():
+                if decoder.alive():
+                    log("standing down: the background is not ours")
+                decoder.stop()
+                current = None
+                sleep_until_next_tick()
+                continue
+
+            if not os.path.isfile(VIDEO):
+                log("video not found: %s" % VIDEO)
+                decoder.stop()
+                current = None
+                sleep_until_next_tick()
+                continue
+
+            if current == target:
+                sleep_until_next_tick()
+                continue
+
+            # A live stream can only serve `target` if it is that close to `current`.
+            gap = target - current if (decoder.alive() and current is not None) else None
+            if gap is None or gap <= 0 or gap > SKIP_MAX:
+                decoder.start(target)
+            else:
+                for _ in range(gap - 1):
+                    if decoder.next_frame() is None:
+                        decoder.start(target)
+                        break
+
+            got = decoder.next_frame()
+            if got is None and decoder.read_count == 0 and not decoder.killed_by_us:
+                # Nothing came out of this stream. A non-zero exit before the
+                # first frame means the hardware decoder cannot handle this
+                # machine or file (ffmpeg does not fall back on its own).
+                code = decoder.exit_code()
+                if _hw_usable is None and code not in (None, 0):
+                    log("hardware decode failed (ffmpeg exit %s); using software" % code)
+                    _hw_usable = False
+                else:
+                    log("no frame from the decoder (ffmpeg exit %s); retrying" % code)
+                decoder.start(target)
+                got = decoder.next_frame()
+
+            if got is not None:
+                index, data = got
+                path = write_frame(data, index)
+                if set_background(path):
+                    current = index
+                    prune_frames(path)
+                    log("minute %d -> frame %d" % (target, index))
+            else:
+                log("no frame for minute %d" % target)
+
+            sleep_until_next_tick()
+    finally:
+        decoder.stop()
+
+
+def dry_run():
+    current = os.path.realpath(BACKGROUND_LINK)
+    kept = sorted(glob.glob(os.path.join(FRAME_DIR, "frame-*.webp")))
+    print("video:       %s (%s)"
+          % (VIDEO, "present" if os.path.isfile(VIDEO) else "MISSING"))
+    print("frame dir:   %s" % FRAME_DIR)
+    print("hwaccel:     %s" % HWACCEL)
+    print("quality:     %d" % QUALITY)
+    print("minute:      %d" % minute_index())
+    print("background:  %s" % current)
+    print("owned:       %s" % ("yes" if owns_background() else "no"))
+    print("kept frames: %d" % len(kept))
+
+
+def _handle_stop(signum, frame):
+    raise _Stop()
+
+
+def main():
+    arguments = sys.argv[1:]
+    if arguments and arguments[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        print()
+        print("Usage: omarchy-time-wallpaper [--dry-run]")
+        print()
+        print("Runs as a long-lived service; --dry-run reports the state and exits.")
+        return 0
+    if arguments and arguments[0] == "--dry-run":
+        dry_run()
+        return 0
+    if arguments:
+        print("Unknown argument: %s" % arguments[0], file=sys.stderr)
+        return 2
+
+    signal.signal(signal.SIGTERM, _handle_stop)
+    signal.signal(signal.SIGINT, _handle_stop)
+    try:
+        run()
+    except _Stop:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

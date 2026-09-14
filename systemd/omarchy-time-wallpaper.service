@@ -1,11 +1,22 @@
 [Unit]
-Description=Set the background to the current minute's timelapse frame
-# No compositor means no shell to retint: skip instead of writing a background
-# into a session that is not there.
+Description=Time-of-day timelapse background
+# Long-lived decoder: it must start with the session and stop with it.
+After=graphical-session.target
+PartOf=graphical-session.target
+# No compositor means no shell to hand a background to; skip the session that
+# is not there instead of decoding frames nobody can see.
 ConditionEnvironment=WAYLAND_DISPLAY
 
 [Service]
-Type=oneshot
-# The frame render is CPU/GPU heavy; never compete with it.
-Nice=10
+Type=simple
 ExecStart=%h/.local/bin/omarchy-time-wallpaper
+# Backstop only: the daemon handles its own errors and never exits on a bad
+# tick, so a restart here means it genuinely died.
+Restart=always
+RestartSec=5
+# One 4K decode per minute is light, but never compete with an interactive
+# session or a Blender render.
+Nice=10
+
+[Install]
+WantedBy=graphical-session.target

@@ -6,34 +6,83 @@
 # all. That file is only a handle: selecting it makes the background pointer
 # land on it, which is what omarchy-time-wallpaper watches for. Its thumbnail is
 # the only thing identifying it in the picker (the picker renders no labels), so
-# the frame it copies should read well as a still.
+# the frame it shows should read well as a still.
 #
-# Frame 0420 (07:00) is the default: bright, and early enough to look like a
-# morning scene. Re-run after adding a theme, or to change the cover.
+# Frame 420 (07:00) is the default: bright, and early enough to look like a
+# morning scene. It is decoded from the video, so the scheme needs nothing but
+# the .mkv. Re-run after adding a theme, or to change the cover.
 set -euo pipefail
 
-FRAMES_DIR=${OMARCHY_TIME_WALLPAPER_DIR:-"$HOME/Work/omarchy-dynamic-wallpaper/indoor/out"}
+VIDEO=${OMARCHY_TIME_WALLPAPER_VIDEO:-"$HOME/Work/omarchy-dynamic-wallpaper/indoor/t_g1440_qp0.mkv"}
 BACKGROUNDS_DIR="$HOME/.config/omarchy/backgrounds"
 SENTINEL_NAME="time-lapse.webp"
-FRAME_INDEX=${1:-0420}
+FRAME_INDEX=${1:-420}
+QUALITY=90
+HWACCEL=${OMARCHY_TIME_WALLPAPER_HWACCEL:-auto}
 
-frame="$FRAMES_DIR/$FRAME_INDEX.webp"
-[[ -f $frame ]] || {
-  echo "frame not found: $frame" >&2
+if [[ ! -f $VIDEO ]]; then
+  echo "video not found: $VIDEO" >&2
   exit 1
+fi
+if [[ ! $FRAME_INDEX =~ ^[0-9]+$ ]]; then
+  echo "frame index must be a number: $FRAME_INDEX" >&2
+  exit 1
+fi
+
+# The only keyframe is frame 0, so this decodes 0..FRAME_INDEX and keeps the
+# last one. Decoding index 420 costs a couple of seconds.
+decode_cover() {
+  local out="$1"
+  local hardware="$2"
+  local acceleration=()
+  if [[ $hardware == cuda ]]; then
+    acceleration=(-hwaccel cuda)
+  fi
+  ffmpeg -nostdin -loglevel error "${acceleration[@]}" \
+    -i "$VIDEO" -vf "select=gte(n\\,$FRAME_INDEX)" -frames:v 1 \
+    -c:v libwebp -quality "$QUALITY" -y "$out"
 }
+
+scratch=$(mktemp --suffix=.webp)
+trap 'rm -f "$scratch"' EXIT
+
+decoded=0
+case $HWACCEL in
+cuda)
+  decode_cover "$scratch" cuda && decoded=1
+  ;;
+none)
+  decode_cover "$scratch" software && decoded=1
+  ;;
+*)
+  if decode_cover "$scratch" cuda; then
+    decoded=1
+  else
+    echo "hardware decode unavailable; using software" >&2
+    decode_cover "$scratch" software && decoded=1
+  fi
+  ;;
+esac
+
+if ((!decoded)) || [[ ! -s $scratch ]]; then
+  echo "could not decode frame $FRAME_INDEX from $VIDEO" >&2
+  exit 1
+fi
 
 installed=0
 for dir in "$BACKGROUNDS_DIR"/*/; do
   [[ -d $dir ]] || continue
   # Not a theme: tenzin keeps loose videos here.
   [[ $(basename "$dir") == "videos" ]] && continue
-  cp -f "$frame" "$dir$SENTINEL_NAME"
-  echo "installed $dir$SENTINEL_NAME"
+  target="$dir$SENTINEL_NAME"
+  # Replace atomically: the picker may be reading the folder right now.
+  cp -f "$scratch" "$target.part"
+  mv -f "$target.part" "$target"
+  echo "installed $target"
   installed=$((installed + 1))
 done
 
-(( installed )) || {
+if ((!installed)); then
   echo "no theme background folders under $BACKGROUNDS_DIR" >&2
   exit 1
-}
+fi

@@ -1,4 +1,0 @@
-#!/bin/bash
-# Show the current minute's frame as soon as the desktop starts, so a login does
-# not have to wait for the timer.
-~/.local/bin/omarchy-time-wallpaper
